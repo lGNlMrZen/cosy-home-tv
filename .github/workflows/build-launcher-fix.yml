@@ -1,0 +1,79 @@
+name: Build Cosy Home TV
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install SDK packages (runner already ships the Android SDK)
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Use default settings if cosy.properties is missing
+        run: '[ -f cosy.properties ] || cp cosy.defaults.properties cosy.properties'
+
+      - name: Build release APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleRelease
+
+      - name: Sign APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          IN=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          mkdir -p dist
+
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > release.jks
+            PASS="$KEYSTORE_PASSWORD"; ALIAS="$KEY_ALIAS"
+          else
+            echo "No keystore secret set: signing with a throwaway key."
+            keytool -genkeypair -keystore release.jks -storepass android \
+              -keypass android -alias debugkey -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=Cosy Home"
+            PASS=android; ALIAS=debugkey
+          fi
+
+          "$BT/zipalign" -f -p 4 "$IN" dist/aligned.apk
+          "$BT/apksigner" sign --ks release.jks --ks-pass "pass:$PASS" \
+            --ks-key-alias "$ALIAS" --out dist/cosy-home-tv.apk dist/aligned.apk
+          "$BT/apksigner" verify dist/cosy-home-tv.apk
+          rm -f dist/aligned.apk release.jks
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cosy-home-tv-apk
+          path: dist/cosy-home-tv.apk
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/cosy-home-tv.apk
